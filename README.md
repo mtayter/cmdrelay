@@ -228,4 +228,4 @@ systemctl --user daemon-reload  # if systemd was used
 
 ## License
 
-MIT (add a `LICENSE` file when publishing).
+This project is licensed under the MIT License — see [LICENSE](LICENSE).
