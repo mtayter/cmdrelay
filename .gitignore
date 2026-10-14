@@ -1,0 +1,31 @@
+# cmdrelay — local secrets, config, runtime data, and build artifacts.
+# NEVER commit any of these. install.sh writes config + token OUTSIDE
+# the repo checkout (default ~/.config/cmdrelay/), but these entries
+# also protect legacy / in-checkout layouts.
+
+# Bearer token (server + worker) — the only credential in the system.
+.token
+*.token
+
+# Local config written by install.sh (hostnames, ports, SSH user).
+config.env
+.config/
+.env
+
+# Runtime data / logs.
+audit.log
+server.log
+worker.log
+*.log
+server.pid
+data/
+
+# Keys / credentials of any kind.
+*.pem
+*.key
+id_*
+*.pub
+
+# Python bytecode.
+__pycache__/
+*.pyc
