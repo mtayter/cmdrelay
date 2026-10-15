@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""slickterm — interactive shell into Slick's VM via the cmdrelay server.
+
+Usage:  ~/.local/share/cmdrelay/slickterm
+Type commands at the slick-vm$ prompt; results print inline.
+Ctrl+C, Ctrl+D, or 'exit' ends the session and disconnects.
+
+slickterm owns the server: it starts server.py on entry if it isn't
+running, and stops it on exit. The worker on the VM runs persistently
+(see worker/cmdrelay-worker-loop.sh) and waits for sessions — no need
+to ask Slick to start the relay first. No LLM tokens are involved in
+any of this: server + worker are plain Python; tokens are only spent
+when the Slick agent itself runs.
+
+Paths come from ~/.config/cmdrelay/config.env (written by
+install.sh --role server): install dir, data dir, bind port, token
+file. If the installed layout is absent, the legacy flat layout
+~/cmdrelay/ (server.py + .token next to each other) is used instead.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import urllib.error
+
+
+def _load_config():
+    """Config file (written by install.sh) + environment, env wins.
+
+    Config file keys use the CMDRELAY_ prefix, one KEY=VALUE per line.
+    """
+    cfg = {}
+    config_dir = os.environ.get("CMDRELAY_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".config", "cmdrelay")
+    try:
+        with open(os.path.join(config_dir, "config.env")) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                cfg[key.strip()] = val.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for key, val in os.environ.items():
+        if key.startswith("CMDRELAY_"):
+            cfg[key] = val
+    cfg.setdefault("CMDRELAY_CONFIG_DIR", config_dir)
+    return cfg
+
+
+_CFG = _load_config()
+_HOME = os.path.expanduser("~")
+_INSTALL_DIR = _CFG.get("CMDRELAY_INSTALL_DIR") or os.path.join(
+    _HOME, ".local", "share", "cmdrelay")
+_LEGACY_DIR = os.path.join(_HOME, "cmdrelay")
+
+# Installed layout wins; legacy flat ~/cmdrelay/ is the fallback.
+if os.path.exists(os.path.join(_INSTALL_DIR, "server.py")):
+    SERVER_PY = os.path.join(_INSTALL_DIR, "server.py")
+    DATA_DIR = _CFG.get("CMDRELAY_DATA_DIR") or _INSTALL_DIR
+else:
+    SERVER_PY = os.path.join(_LEGACY_DIR, "server.py")
+    DATA_DIR = _LEGACY_DIR
+
+try:
+    _PORT = int(_CFG.get("CMDRELAY_BIND_PORT", "8770"))
+except ValueError:
+    _PORT = 8770
+BASE = "http://127.0.0.1:%d" % _PORT
+
+TOKEN_FILE = (
+    _CFG.get("CMDRELAY_TOKEN_FILE")
+    or os.path.join(_CFG["CMDRELAY_CONFIG_DIR"], ".token")
+)
+if not os.path.exists(TOKEN_FILE) and os.path.exists(
+        os.path.join(_LEGACY_DIR, ".token")):
+    TOKEN_FILE = os.path.join(_LEGACY_DIR, ".token")  # legacy location
+
+SERVER_PID_FILE = os.path.join(DATA_DIR, "server.pid")
+SERVER_LOG = os.path.join(DATA_DIR, "server.log")
+
+
+class ApiError(Exception):
+    pass
+
+
+def api(method, path, data=None, timeout=70):
+    req = urllib.request.Request(
+        BASE + path, method=method,
+        headers={"Authorization": "Bearer " + TOKEN,
+                 "Content-Type": "application/json"},
+        data=json.dumps(data).encode() if data is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise ApiError("HTTP %d" % e.code)
+    except OSError as e:
+        raise ApiError(str(e))
+
+
+def server_reachable():
+    try:
+        return api("GET", "/health", timeout=2).get("ok") is True
+    except ApiError:
+        return False
+
+
+def start_server():
+    """Start server.py detached. Returns True on success."""
+    try:
+        logf = open(SERVER_LOG, "a")
+    except OSError:
+        logf = subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            ["python3", SERVER_PY],
+            stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    finally:
+        if logf is not subprocess.DEVNULL:
+            logf.close()
+    for _ in range(20):
+        if server_reachable():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def stop_server():
+    """Stop the server (pid file first, pkill fallback). Best-effort."""
+    try:
+        with open(SERVER_PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    for _ in range(10):
+        if not server_reachable():
+            return
+        time.sleep(0.3)
+    subprocess.run(["pkill", "-f", "cmdrelay/server.py"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    global TOKEN
+    try:
+        with open(TOKEN_FILE) as f:
+            TOKEN = f.read().strip()
+    except OSError:
+        print("cannot read token file %s" % TOKEN_FILE)
+        return 1
+    if not TOKEN:
+        print("empty token")
+        return 1
+
+    # Own the server: start it if it isn't running (e.g. first run, or a
+    # previous slickterm was killed and left a stale server — reuse it).
+    if not server_reachable():
+        print("starting relay server...", flush=True)
+        if not start_server():
+            print("could not start relay server — check %s" % SERVER_LOG)
+            return 1
+
+    session_started = False
+    try:
+        api("POST", "/session/start", {}, timeout=10)
+        session_started = True
+    except ApiError as e:
+        if "409" in str(e):
+            print("a relay session is already active")
+            # Another slickterm owns the server — do NOT stop it.
+            return 1
+        else:
+            print("relay server not reachable (%s)" % e)
+            stop_server()
+            return 1
+
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(30):
+            try:
+                api("POST", "/session/beat", {}, timeout=10)
+            except Exception:
+                pass
+
+    threading.Thread(target=beat, daemon=True).start()
+
+    print("waiting for Slick's worker...", flush=True)
+    for _ in range(60):
+        try:
+            st = api("GET", "/session/status", timeout=10)
+        except ApiError:
+            time.sleep(2)
+            continue
+        if not st.get("active"):
+            print("session lost")
+            stop_server()
+            return 1
+        if st.get("worker_alive"):
+            break
+        time.sleep(2)
+    else:
+        print("worker never showed up — the persistent worker may be down")
+        try:
+            api("POST", "/session/end", {}, timeout=10)
+        except ApiError:
+            pass
+        time.sleep(1.5)  # let the worker see session_end before the server dies
+        stop_server()
+        return 1
+
+    print("connected — type commands, Ctrl+C / Ctrl+D / 'exit' to quit.")
+    cwd = ""
+    try:
+        while True:
+            try:
+                prompt = "slick-vm:%s$ " % cwd if cwd else "slick-vm$ "
+                cmd = input(prompt)
+            except EOFError:
+                break
+            s = cmd.strip()
+            if not s:
+                continue
+            if s in ("exit", "quit"):
+                break
+            try:
+                cid = api("POST", "/cmd", {"command": cmd}, timeout=15)["id"]
+            except ApiError as e:
+                print("failed to send command: %s" % e)
+                break
+            while True:
+                res = api("GET", "/result/%d?wait=55" % cid)
+                if res.get("status") == "pending":
+                    continue
+                if res.get("status") == "no_session":
+                    print("(session ended)")
+                    return 0
+                break
+            if res.get("cwd"):
+                cwd = res["cwd"]
+            if res["stdout"]:
+                sys.stdout.write(res["stdout"])
+                if not res["stdout"].endswith("\n"):
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+            if res["stderr"]:
+                sys.stderr.write(res["stderr"])
+                if not res["stderr"].endswith("\n"):
+                    sys.stderr.write("\n")
+                sys.stderr.flush()
+            if res["exit_code"] != 0:
+                print("[exit %d]" % res["exit_code"])
+            if res.get("truncated"):
+                print("[output truncated at 256KB]")
+    except KeyboardInterrupt:
+        print()
+    finally:
+        stop.set()
+        try:
+            api("POST", "/session/end", {}, timeout=10)
+        except ApiError:
+            pass
+        # Give the worker a moment to see session_end via its long-poll
+        # before the server disappears — otherwise it ends via the
+        # failure path (still correct, just noisier).
+        time.sleep(1.5)
+        stop_server()
+        print("disconnected.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

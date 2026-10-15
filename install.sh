@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# cmdrelay install.sh — two-sided installer for the cmdrelay shell relay.
+# cmdrelay install.sh — three-sided installer for the cmdrelay shell relay.
 #
 #   Server role (human's machine): installs server.py, generates a bearer
 #       token into ~/.config/cmdrelay/.token (0600), writes config.
-#   Worker role (agent VM): installs worker.py, prompts for the server's
-#       SSH host/user and the token printed by the server install, writes
-#       config. The human carries the token across: display -> paste.
+#   Worker role (agent VM): installs worker.py + the worker loop,
+#       prompts for the server's SSH host/user and the token printed by
+#       the server install, writes config. The human carries the token
+#       across: display -> paste.
+#   Client role (human's machine, same box as the server): installs
+#       slickterm, the interactive client that owns the server
+#       (starts it on entry, stops it on exit).
 #
 # Usage:
 #   ./install.sh --role server [--non-interactive]
-#   ./install.sh --role worker [--non-interactive] [--with-systemd]
+#   ./install.sh --role worker [--non-interactive]
+#   ./install.sh --role client [--non-interactive]
 #
 # Idempotent: safe to re-run. Re-install reads the existing config for
-# defaults, NEVER regenerates an existing token, and overwrites (never
-# duplicates) the systemd unit file.
+# defaults, NEVER regenerates an existing token.
 #
 # Secrets: this script never enables tracing around secret handling
 # (no `set -x`). The server token is printed ONCE, only when newly
@@ -21,7 +25,7 @@
 # never collected — SSH uses key auth / your ~/.ssh/config.
 #
 # Non-interactive mode (--non-interactive) reads these env vars:
-#   CMDRELAY_ROLE            server|worker (or pass --role)
+#   CMDRELAY_ROLE            server|worker|client (or pass --role)
 #   CMDRELAY_CONFIG_DIR      default ~/.config/cmdrelay
 #   CMDRELAY_INSTALL_DIR     default ~/.local/share/cmdrelay
 #   Server: CMDRELAY_BIND_HOST (default 127.0.0.1),
@@ -33,20 +37,24 @@
 #           CMDRELAY_TUNNEL_PORT (default 18770),
 #           CMDRELAY_TOKEN (token pasted from the server install;
 #             prefer the interactive paste prompt — env is only for
-#             scripted installs where the token is already protected),
-#           CMDRELAY_WITH_SYSTEMD=1 (install the systemd user unit)
+#             scripted installs where the token is already protected)
+#   Client: no prompts, no config changes — just copies slickterm.
+#
+# NOTE: there is no systemd option. The worker runs under the
+# persistent loop (worker/cmdrelay-worker-loop.sh, installed next to
+# worker.py); systemd user units do not survive VM refresh, and the
+# loop is the canonical keeper. See README.md.
 set -euo pipefail
 umask 077
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROLE="${CMDRELAY_ROLE:-}"
 NON_INTERACTIVE=0
-WITH_SYSTEMD="${CMDRELAY_WITH_SYSTEMD:-0}"
 CONFIG_DIR="${CMDRELAY_CONFIG_DIR:-$HOME/.config/cmdrelay}"
 INSTALL_DIR="${CMDRELAY_INSTALL_DIR:-$HOME/.local/share/cmdrelay}"
 
 usage() {
-    sed -n '1,40p' "$0"
+    sed -n '1,60p' "$0"
     exit "${1:-0}"
 }
 
@@ -63,8 +71,6 @@ while [ $# -gt 0 ]; do
         --config-dir=*) CONFIG_DIR="${1#--config-dir=}"; shift ;;
         --install-dir) INSTALL_DIR="${2:-}"; shift 2 ;;
         --install-dir=*) INSTALL_DIR="${1#--install-dir=}"; shift ;;
-        --with-systemd) WITH_SYSTEMD=1; shift ;;
-        --no-systemd) WITH_SYSTEMD=0; shift ;;
         -h|--help) usage 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -142,14 +148,14 @@ write_config() {
 # --- role selection ---------------------------------------------------------
 if [ -z "$ROLE" ]; then
     if [ "$NON_INTERACTIVE" -eq 1 ] || ! is_tty; then
-        die "no role given: pass --role server|worker or set CMDRELAY_ROLE"
+        die "no role given: pass --role server|worker|client or set CMDRELAY_ROLE"
     fi
-    printf 'Install role [server/worker]: ' >&2
+    printf 'Install role [server/worker/client]: ' >&2
     IFS= read -r ROLE || true
 fi
 case "$ROLE" in
-    server|worker) ;;
-    *) die "--role must be server or worker, got: $ROLE" ;;
+    server|worker|client) ;;
+    *) die "--role must be server, worker, or client, got: $ROLE" ;;
 esac
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
@@ -160,9 +166,20 @@ chmod 700 "$CONFIG_DIR" 2>/dev/null || true
 
 TOKEN_FILE="$CONFIG_DIR/.token"
 
+# --- client role ------------------------------------------------------------
+if [ "$ROLE" = client ]; then
+    cp "$REPO_DIR/client/slickterm" "$INSTALL_DIR/slickterm"
+    chmod 755 "$INSTALL_DIR/slickterm"
+    printf 'Client installed.\n'
+    printf '  Run:      %s/slickterm\n' "$INSTALL_DIR"
+    printf '  (slickterm starts the server on entry and stops it on exit;\n'
+    printf '   run ./install.sh --role server first if the server is not installed.)\n'
+    exit 0
+fi
+
 # --- server role ------------------------------------------------------------
 if [ "$ROLE" = server ]; then
-    cp "$REPO_DIR/server.py" "$INSTALL_DIR/server.py"
+    cp "$REPO_DIR/server/server.py" "$INSTALL_DIR/server.py"
     chmod 755 "$INSTALL_DIR/server.py"
 
     TOKEN_GENERATED=0
@@ -215,16 +232,20 @@ if [ "$ROLE" = server ]; then
     printf '  (Your client starts/stops the server on demand; no systemd unit is installed for the server.)\n'
     printf '  Next:     on the worker machine, run: ./install.sh --role worker\n'
     printf '            and paste the token above when prompted.\n'
+    printf '            On this machine, run: ./install.sh --role client\n'
+    printf '            to install slickterm.\n'
     exit 0
 fi
 
 # --- worker role ------------------------------------------------------------
-cp "$REPO_DIR/worker.py" "$INSTALL_DIR/worker.py"
+cp "$REPO_DIR/worker/worker.py" "$INSTALL_DIR/worker.py"
 chmod 755 "$INSTALL_DIR/worker.py"
+cp "$REPO_DIR/worker/cmdrelay-worker-loop.sh" "$INSTALL_DIR/cmdrelay-worker-loop.sh"
+chmod 755 "$INSTALL_DIR/cmdrelay-worker-loop.sh"
 
 SSH_HOST="${CMDRELAY_SSH_HOST:-$(config_get CMDRELAY_SSH_HOST)}"
 SSH_USER="${CMDRELAY_SSH_USER:-$(config_get CMDRELAY_SSH_USER)}"
-SSH_USER="${SSH_USER:-$USER}"
+SSH_USER="${SSH_USER:-${USER:-$(id -un)}}"
 SERVER_PORT="${CMDRELAY_SERVER_PORT:-$(config_get CMDRELAY_SERVER_PORT)}"
 SERVER_PORT="${SERVER_PORT:-8770}"
 TUNNEL_PORT="${CMDRELAY_TUNNEL_PORT:-$(config_get CMDRELAY_TUNNEL_PORT)}"
@@ -275,49 +296,11 @@ write_config \
 chmod 600 "$CONFIG_DIR/config.env"
 note "wrote $CONFIG_DIR/config.env (0600)"
 
-# Optional persistent worker via a systemd user unit (default: no).
-if [ "$WITH_SYSTEMD" -eq 0 ] && [ "$NON_INTERACTIVE" -eq 0 ] && is_tty; then
-    ans=""
-    printf 'Install a systemd user service to keep the worker running? [y/N]: ' >&2
-    IFS= read -r ans || true
-    case "$ans" in [Yy]|[Yy]es) WITH_SYSTEMD=1 ;; esac
-fi
-if [ "$WITH_SYSTEMD" -eq 1 ]; then
-    UNIT_DIR="$HOME/.config/systemd/user"
-    mkdir -p "$UNIT_DIR"
-    # Overwrite the same file on re-install: never duplicates the unit.
-    cat > "$UNIT_DIR/cmdrelay-worker.service" <<EOF
-[Unit]
-Description=cmdrelay worker (shell relay)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/env python3 $INSTALL_DIR/worker.py
-Environment=CMDRELAY_CONFIG_DIR=$CONFIG_DIR
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-EOF
-    chmod 644 "$UNIT_DIR/cmdrelay-worker.service"
-    note "wrote $UNIT_DIR/cmdrelay-worker.service"
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user daemon-reload || true
-        systemctl --user enable --now cmdrelay-worker.service || \
-            note "systemctl enable failed — start manually: systemctl --user start cmdrelay-worker.service"
-    else
-        note "systemctl not found — enable the unit manually when systemd is available"
-    fi
-fi
-
 printf 'Worker installed.\n'
 printf '  Run manually:  python3 %s/worker.py\n' "$INSTALL_DIR"
-if [ "$WITH_SYSTEMD" -eq 1 ]; then
-    printf '  Or via systemd:  systemctl --user status cmdrelay-worker.service\n'
-fi
+printf '  Or via the loop: bash %s/cmdrelay-worker-loop.sh\n' "$INSTALL_DIR"
+printf '  (The loop respawns worker.py on crash; it is the canonical keeper.\n'
+printf '   There is no systemd option — systemd units do not survive VM refresh.)\n'
 printf '  Check SSH first: ssh %s@%s true\n' "$SSH_USER" "$SSH_HOST"
 printf '  (The worker idles until a client starts a session on the server.)\n'
 exit 0

@@ -4,7 +4,7 @@ A human types commands in a terminal on their own machine; the commands
 execute on an agent VM; output comes back. Nothing runs unless a session
 is active.
 
-Two halves, connected by an SSH tunnel:
+Three parts, connected by an SSH tunnel:
 
 - **Server** (human's machine): a small HTTP relay, loopback-only, with
   bearer-token auth. It holds one active session at a time: a queue of
@@ -12,12 +12,17 @@ Two halves, connected by an SSH tunnel:
 - **Worker** (agent VM): opens an SSH tunnel to the server, long-polls
   for commands, runs each in **one persistent bash** (so `cd`, `alias`,
   `export`, shell functions, `pushd`, `source` all stick across
-  commands), and posts back output, exit code, and cwd.
+  commands), and posts back output, exit code, and cwd. The worker runs
+  persistently under a loop (`worker/cmdrelay-worker-loop.sh`) and
+  waits idle when no session is active.
+- **Client** (human's machine, same box as the server): `slickterm`,
+  the interactive terminal. It owns the server: starts it on entry if
+  it isn't running, starts a session, sends commands, polls for
+  results, and stops the server on exit. Any client that speaks the
+  protocol below also works.
 
-A client on the human's machine owns the server: it starts the server
-on entry if it isn't running, starts a session, sends commands, polls
-for results, and stops the server on exit. **This repo does not include
-a client** — any client that speaks the protocol below works.
+Where each part runs: the worker runs on the agent VM; the server and
+the client both run on the human's machine.
 
 ## Dependencies
 
@@ -26,15 +31,14 @@ a client** — any client that speaks the protocol below works.
 - OpenSSH client (`ssh`) on the worker machine, for the tunnel.
 - `bash` for `install.sh`.
 - `openssl` (or Python 3) for token generation during install.
-- Optional: `systemd` (user instance) if you want the worker to run persistently.
 
 ## Install
 
-Clone the repo on **both** machines, then run the installer on each.
-Config is written **outside** the repo checkout, to
-`~/.config/cmdrelay/` (0600 perms). Re-running the installer is safe:
-it reads the existing config for defaults and never regenerates an
-existing token.
+Clone the repo on **both** machines, then run the installer with the
+role for that machine. Config is written **outside** the repo checkout,
+to `~/.config/cmdrelay/` (0600 perms). Re-running the installer is
+safe: it reads the existing config for defaults and never regenerates
+an existing token.
 
 ### 1. Server role (human's machine)
 
@@ -52,7 +56,7 @@ What the installer asks / collects:
 
 What it does:
 
-- Copies `server.py` to `~/.local/share/cmdrelay/server.py`.
+- Copies `server/server.py` to `~/.local/share/cmdrelay/server.py`.
 - Generates a random bearer token (32 bytes, hex) into
   `~/.config/cmdrelay/.token` (0600) — **only if none exists**.
 - Writes `~/.config/cmdrelay/config.env` (0600).
@@ -72,7 +76,7 @@ is installed for the server.)
 ### 2. Worker role (agent VM)
 
 ```sh
-./install.sh --role worker [--with-systemd]
+./install.sh --role worker
 ```
 
 What the installer asks / collects:
@@ -87,15 +91,21 @@ What the installer asks / collects:
 
 What it does:
 
-- Copies `worker.py` to `~/.local/share/cmdrelay/worker.py`.
+- Copies `worker/worker.py` and `worker/cmdrelay-worker-loop.sh` to
+  `~/.local/share/cmdrelay/`.
 - Writes the pasted token to `~/.config/cmdrelay/.token` (0600),
   or keeps the existing token if you pressed Enter.
 - Writes `~/.config/cmdrelay/config.env` (0600).
-- With `--with-systemd` (or answering yes), installs
-  `~/.config/systemd/user/cmdrelay-worker.service` (overwritten, never
-  duplicated, on re-install) and enables/starts it.
 
-Run the worker manually with:
+Run the worker via the loop with:
+
+```sh
+bash ~/.local/share/cmdrelay/cmdrelay-worker-loop.sh
+```
+
+The loop respawns `worker.py` on crash and is the canonical keeper —
+there is no systemd option (systemd user units do not survive VM
+refresh). Or run the worker manually with:
 
 ```sh
 python3 ~/.local/share/cmdrelay/worker.py
@@ -104,24 +114,48 @@ python3 ~/.local/share/cmdrelay/worker.py
 Check SSH first: `ssh <user>@<host> true`. The worker idles until a
 client starts a session on the server.
 
+### 3. Client role (human's machine, same box as the server)
+
+```sh
+./install.sh --role client
+```
+
+What it does:
+
+- Copies `client/slickterm` to `~/.local/share/cmdrelay/slickterm`.
+  No prompts, no config changes — the client reads the token, port,
+  and paths from the config the server install already wrote
+  (`~/.config/cmdrelay/config.env`).
+
+Run it with:
+
+```sh
+~/.local/share/cmdrelay/slickterm
+```
+
+`slickterm` starts the server on entry (if it isn't running) and
+stops it on exit. Type commands at the `slick-vm$` prompt; Ctrl+C,
+Ctrl+D, or `exit` ends the session and disconnects.
+
 ### Non-interactive install
 
 ```sh
 ./install.sh --role server --non-interactive
 CMDRELAY_SSH_HOST=<your-hostname> CMDRELAY_TOKEN=<token-from-server-install> \
     ./install.sh --role worker --non-interactive
+./install.sh --role client --non-interactive
 ```
 
 Non-interactive mode reads these environment variables:
 
-- Both roles: `CMDRELAY_ROLE`, `CMDRELAY_CONFIG_DIR`
+- All roles: `CMDRELAY_ROLE`, `CMDRELAY_CONFIG_DIR`
   (default `~/.config/cmdrelay`), `CMDRELAY_INSTALL_DIR`
   (default `~/.local/share/cmdrelay`).
 - Server: `CMDRELAY_BIND_HOST`, `CMDRELAY_BIND_PORT`,
   `CMDRELAY_DATA_DIR`.
 - Worker: `CMDRELAY_SSH_HOST` (required), `CMDRELAY_SSH_USER`,
   `CMDRELAY_SERVER_PORT`, `CMDRELAY_TUNNEL_PORT`,
-  `CMDRELAY_TOKEN`, `CMDRELAY_WITH_SYSTEMD=1`.
+  `CMDRELAY_TOKEN`.
 - Either role: `CMDRELAY_TOKEN_FILE` (non-default token location),
   `CMDRELAY_TOKEN` (runtime override — prefer the token file).
 
@@ -132,19 +166,23 @@ Passwords are never collected — SSH uses key auth / your
 
 | File | What it is |
 |---|---|
-| `server.py` | Relay server (loopback HTTP, token auth, session queue). |
-| `worker.py` | Worker (SSH tunnel, long-poll, persistent bash). |
-| `install.sh` | Two-sided installer (`--role server\|worker`). |
+| `server/server.py` | Relay server (loopback HTTP, token auth, session queue). |
+| `worker/worker.py` | Worker (SSH tunnel, long-poll, persistent bash). |
+| `worker/cmdrelay-worker-loop.sh` | Loop that keeps the worker running (respawns on crash). |
+| `client/slickterm` | Interactive client (owns the server: starts/stops it). |
+| `install.sh` | Three-sided installer (`--role server\|worker\|client`). |
 | `~/.config/cmdrelay/config.env` | Per-machine config (0600, gitignored). |
 | `~/.config/cmdrelay/.token` | Bearer token (0600, gitignored, never committed). |
 | `~/.cmdrelay_bashrc` | Startup file sourced by the worker's persistent shell (created with a default alias if missing). |
 
 Legacy layouts are still honored: a `.token` next to `server.py` /
-`worker.py` is used if no config-dir token exists.
+`worker.py` is used if no config-dir token exists, and `slickterm`
+falls back to the flat `~/cmdrelay/` layout if the installed layout
+is absent.
 
 ## How a session works
 
-1. The client starts the server (if needed) and posts
+1. The client (`slickterm`) starts the server (if needed) and posts
    `POST /session/start`.
 2. The worker's SSH tunnel connects; the worker long-polls
    `GET /take?wait=55` and the client heartbeats
@@ -219,11 +257,11 @@ Still NOT terminal-like in Phase 1 (needs a Phase 2 PTY for these):
 ## Uninstall
 
 ```sh
-# Stop the worker first if it runs under systemd:
-systemctl --user disable --now cmdrelay-worker.service  # if installed
+# Stop the worker loop and worker first (on the VM):
+pkill -f cmdrelay-worker-loop.sh; pkill -f cmdrelay/worker.py
+# Stop the server if a client left it running (on the server machine):
+pkill -f cmdrelay/server.py
 rm -rf ~/.local/share/cmdrelay ~/.config/cmdrelay
-rm -f ~/.config/systemd/user/cmdrelay-worker.service
-systemctl --user daemon-reload  # if systemd was used
 ```
 
 ## License
