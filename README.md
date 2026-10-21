@@ -173,12 +173,7 @@ Passwords are never collected — SSH uses key auth / your
 | `install.sh` | Three-sided installer (`--role server\|worker\|client`). |
 | `~/.config/cmdrelay/config.env` | Per-machine config (0600, gitignored). |
 | `~/.config/cmdrelay/.token` | Bearer token (0600, gitignored, never committed). |
-| `~/.cmdrelay_bashrc` | Startup file sourced by the worker's persistent shell (created with a default alias if missing). |
-
-Legacy layouts are still honored: a `.token` next to `server.py` /
-`worker.py` is used if no config-dir token exists, and `slickterm`
-falls back to the flat `~/cmdrelay/` layout if the installed layout
-is absent.
+| `~/.cmdrelay_bashrc` | Startup file sourced by the worker's persistent shell (created with a default alias if missing). If a pre-rename `~/.slickterm_bashrc` exists, the worker uses that instead. |
 
 ## How a session works
 
