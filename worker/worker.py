@@ -11,8 +11,7 @@ starts the server on entry (if needed) and stops it on exit.
 
 Configuration: environment variables (CMDRELAY_*) override
 ~/.config/cmdrelay/config.env (written by install.sh).
-Token: CMDRELAY_TOKEN_FILE, else ~/.config/cmdrelay/.token,
-else .token next to this file (legacy).
+Token: CMDRELAY_TOKEN_FILE, else ~/.config/cmdrelay/.token.
 
 No LLM tokens are involved: this is plain Python long-polling.
 Idle cost is one SSH tunnel + a /session/status poll every 2s.
@@ -110,9 +109,6 @@ if not TOKEN:
         _CFG.get("CMDRELAY_TOKEN_FILE")
         or os.path.join(_CFG["CMDRELAY_CONFIG_DIR"], ".token")
     )
-    if not os.path.exists(_token_file) and os.path.exists(
-            os.path.join(HERE, ".token")):
-        _token_file = os.path.join(HERE, ".token")  # legacy location
     try:
         with open(_token_file) as f:
             TOKEN = f.read().strip()

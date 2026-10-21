@@ -9,8 +9,7 @@ and an agent VM.
   long-polls /result/<id>.
 - Configuration: environment variables (CMDRELAY_*) override
   ~/.config/cmdrelay/config.env (written by install.sh).
-  Token: CMDRELAY_TOKEN_FILE, else ~/.config/cmdrelay/.token,
-  else .token next to this file (legacy).
+  Token: CMDRELAY_TOKEN_FILE, else ~/.config/cmdrelay/.token.
 - Run:  python3 server.py   (logs to audit.log in the data dir)
 """
 import json
@@ -59,9 +58,6 @@ TOKEN_FILE = (
     _CFG.get("CMDRELAY_TOKEN_FILE")
     or os.path.join(_CFG["CMDRELAY_CONFIG_DIR"], ".token")
 )
-if not os.path.exists(TOKEN_FILE) and os.path.exists(
-        os.path.join(HERE, ".token")):
-    TOKEN_FILE = os.path.join(HERE, ".token")  # legacy location
 AUDIT_LOG = os.path.join(DATA_DIR, "audit.log")
 BEAT_TIMEOUT = 120  # session auto-ends after this long without a CLI heartbeat
 

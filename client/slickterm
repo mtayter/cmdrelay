@@ -14,8 +14,7 @@ when the Slick agent itself runs.
 
 Paths come from ~/.config/cmdrelay/config.env (written by
 install.sh --role server): install dir, data dir, bind port, token
-file. If the installed layout is absent, the legacy flat layout
-~/cmdrelay/ (server.py + .token next to each other) is used instead.
+file.
 """
 import json
 import os
@@ -57,15 +56,8 @@ _CFG = _load_config()
 _HOME = os.path.expanduser("~")
 _INSTALL_DIR = _CFG.get("CMDRELAY_INSTALL_DIR") or os.path.join(
     _HOME, ".local", "share", "cmdrelay")
-_LEGACY_DIR = os.path.join(_HOME, "cmdrelay")
-
-# Installed layout wins; legacy flat ~/cmdrelay/ is the fallback.
-if os.path.exists(os.path.join(_INSTALL_DIR, "server.py")):
-    SERVER_PY = os.path.join(_INSTALL_DIR, "server.py")
-    DATA_DIR = _CFG.get("CMDRELAY_DATA_DIR") or _INSTALL_DIR
-else:
-    SERVER_PY = os.path.join(_LEGACY_DIR, "server.py")
-    DATA_DIR = _LEGACY_DIR
+SERVER_PY = os.path.join(_INSTALL_DIR, "server.py")
+DATA_DIR = _CFG.get("CMDRELAY_DATA_DIR") or _INSTALL_DIR
 
 try:
     _PORT = int(_CFG.get("CMDRELAY_BIND_PORT", "8770"))
@@ -77,10 +69,6 @@ TOKEN_FILE = (
     _CFG.get("CMDRELAY_TOKEN_FILE")
     or os.path.join(_CFG["CMDRELAY_CONFIG_DIR"], ".token")
 )
-if not os.path.exists(TOKEN_FILE) and os.path.exists(
-        os.path.join(_LEGACY_DIR, ".token")):
-    TOKEN_FILE = os.path.join(_LEGACY_DIR, ".token")  # legacy location
-
 SERVER_PID_FILE = os.path.join(DATA_DIR, "server.pid")
 SERVER_LOG = os.path.join(DATA_DIR, "server.log")
 
