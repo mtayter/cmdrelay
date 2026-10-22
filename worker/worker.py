@@ -349,6 +349,13 @@ def _stop_tunnel(tun):
             pass
 
 
+def _start_tunnel(ssh_target):
+    return subprocess.Popen(
+        ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+         "-L", "%d:127.0.0.1:%d" % (TUNNEL_PORT, SERVER_PORT), ssh_target],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _serve_one_session():
     """One tunnel + one session. Returns when the session ends or the
     server/tunnel goes away. Never kills the server — the client owns it."""
@@ -357,20 +364,30 @@ def _serve_one_session():
             "cmdrelay worker: no SSH host configured "
             "(set CMDRELAY_SSH_HOST or run install.sh --role worker)")
     ssh_target = ("%s@%s" % (SSH_USER, SSH_HOST)) if SSH_USER else SSH_HOST
-    tun = subprocess.Popen(
-        ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
-         "-L", "%d:127.0.0.1:%d" % (TUNNEL_PORT, SERVER_PORT), ssh_target],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    tun = _start_tunnel(ssh_target)
     shell = None
     try:
         # Idle wait: server is down until the client starts it. Poll quietly
-        # (no log spam) until a session appears.
+        # (no log spam) until a session appears. Supervise the tunnel while
+        # idle: if the ssh child exits, the API poll below just fails
+        # forever and the dead child is never reaped (the 2026-10-21/22
+        # zombie-tunnel outages), so respawn it — poll() reaps it — with
+        # backoff so a down server can't hot-loop the respawn.
+        tunnel_deaths = 0
         while True:
+            if tun.poll() is not None:
+                log("tunnel exited (code %s) while idle, respawning"
+                    % tun.returncode)
+                tun = _start_tunnel(ssh_target)
+                tunnel_deaths += 1
+                time.sleep(min(3 * 2 ** min(tunnel_deaths, 4), 60))
+                continue
             try:
                 st = api("GET", "/session/status", timeout=15)
             except Exception:
                 time.sleep(2)
                 continue
+            tunnel_deaths = 0
             if st.get("active"):
                 break
             time.sleep(2)
